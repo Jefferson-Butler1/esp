@@ -1,296 +1,244 @@
-#include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 
-// WiFi network configuration
-const char* WIFI_SSID = "Harold";
-const char* WIFI_PASSWORD = "gigantic";
+// WiFi credentials for your main network
+const char* ssid = "Harold";
+const char* password = "gigantic";
 
-// Mac server configuration
-const char* MAC_SERVER_IP = "192.168.0.100";
-const int MAC_SERVER_PORT = 3200;
+// Server details
+const char* serverIP = "192.168.0.100";
+const int serverPort = 3200;
 
-// For RSSI measurements between nodes
-const int RSSI_SAMPLES = 5;
-const int SCAN_INTERVAL = 1000;
+// Node variables
+int nodeId = -1;                         // Will be assigned by server
+String apSSID = "";                      // Will be "node-X" where X is nodeId
+const int MAX_NODES = 10;                // Maximum number of nodes to track
+String nodeSSIDs[MAX_NODES];             // Array to store other node SSIDs
+int lastRSSI[MAX_NODES];                 // Array to store last RSSI values
 
-WebSocketsClient webSocket;
-unsigned long lastPingTime = 0;
+// Timing variables
 unsigned long lastScanTime = 0;
-const int pingInterval = 5000;
+const int scanInterval = 100;            // 100ms interval for 10Hz frequency
 
-String nodeID = ""; // Will be set after connecting to server
-String macAddress = "";
-
-// Map to store RSSI measurements between this node and other nodes
-struct NodeRSSI {
-  String nodeID;
-  int rssi;
-  unsigned long lastUpdate;
-};
-
-#define MAX_NODES 10
-NodeRSSI knownNodes[MAX_NODES];
-int nodeCount = 0;
-
-void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-  switch (type) {
-    case WStype_DISCONNECTED:
-      Serial.println("WebSocket disconnected!");
-      break;
-      
-    case WStype_CONNECTED:
-      Serial.println("WebSocket connected!");
-      delay(500);
-      
-      // Register with server
-      Serial.println("Sending REGISTER message...");
-      webSocket.sendTXT("REGISTER");
-      
-      // Also send our MAC address for node identification
-      String macMsg = "MAC:" + macAddress;
-      webSocket.sendTXT(macMsg);
-      break;
-      
-    case WStype_TEXT: {
-      Serial.print("Received text: ");
-      String message = "";
-      for(size_t i=0; i < length; i++) {
-        message += (char)payload[i];
-      }
-      Serial.println(message);
-      
-      // Check if this is an ID assignment message
-      if (message.startsWith("ID:")) {
-        nodeID = message.substring(3);
-        Serial.print("Assigned node ID: ");
-        Serial.println(nodeID);
-        
-        // Start auto-calibration process
-        requestCalibration();
-      }
-      // Check if we received a calibration command
-      else if (message.startsWith("CALIBRATE")) {
-        startCalibration();
-      }
-      break;
-    }
-    
-    case WStype_ERROR:
-      Serial.println("WebSocket error!");
-      break;
-      
-    default:
-      Serial.print("WebSocket event type: ");
-      Serial.println(type);
-      break;
-  }
-}
-
-// Request calibration from the server
-void requestCalibration() {
-  if (nodeID.length() == 0) {
-    Serial.println("Cannot request calibration: Node ID not yet assigned");
-    return;
-  }
-  
-  Serial.println("Requesting auto-calibration from server...");
-  
-  // Create JSON document for calibration request
-  JsonDocument doc;
-  doc["type"] = "calibration_request";
-  doc["node_id"] = nodeID;
-  doc["mac"] = macAddress;
-  
-  // Serialize to string
-  String jsonStr;
-  serializeJson(doc, jsonStr);
-  
-  // Send to server
-  webSocket.sendTXT(jsonStr);
-}
-
-// Start calibration process - scan for other ESP nodes
-void startCalibration() {
-  Serial.println("Starting auto-calibration process...");
-  Serial.println("Scanning for other ESP nodes...");
-  
-  // Perform WiFi scan to find other nodes
-  scanForOtherNodes();
-  
-  // Send results to server
-  reportCalibrationResults();
-}
-
-// Scan for other ESP nodes by looking for their WiFi signals
-void scanForOtherNodes() {
-  int numNetworks = WiFi.scanNetworks();
-  
-  if (numNetworks == 0) {
-    Serial.println("No networks found");
-    return;
-  }
-  
-  Serial.printf("Found %d networks\n", numNetworks);
-  
-  // Look for ESP nodes - they usually have MAC addresses starting with specific prefixes
-  // Common ESP8266 MAC prefixes: 5C:CF:7F, 18:FE:34, 24:0A:C4, etc.
-  for (int i = 0; i < numNetworks; i++) {
-    String ssid = WiFi.SSID(i);
-    String bssid = WiFi.BSSIDstr(i);
-    int rssi = WiFi.RSSI(i);
-    
-    Serial.printf("%d: %s (%s) %d dBm\n", i + 1, ssid.c_str(), bssid.c_str(), rssi);
-    
-    // Check if this is likely an ESP8266
-    // In a real implementation, you'd want a more reliable way to identify your ESP nodes
-    // such as having them broadcast a specific SSID prefix
-    if (isESPMacAddress(bssid)) {
-      // Store or update RSSI for this node
-      updateNodeRSSI(bssid, rssi);
-    }
-  }
-  
-  // Clean up scan resources
-  WiFi.scanDelete();
-}
-
-// Simple check if a MAC address likely belongs to an ESP8266
-// This is just a basic implementation - you might need to customize this
-bool isESPMacAddress(String mac) {
-  // Common ESP8266 MAC address prefixes
-  // These are just examples, your devices may have different prefixes
-  const char* espPrefixes[] = {"5C:CF:7F", "18:FE:34", "24:0A:C4", "60:01:94", "A4:CF:12"};
-  const int numPrefixes = 5;
-  
-  for (int i = 0; i < numPrefixes; i++) {
-    if (mac.startsWith(espPrefixes[i])) {
-      return true;
-    }
-  }
-  
-  // Alternative check: exclude known non-ESP devices
-  if (mac.startsWith("00:00:00") || mac.equals(WiFi.macAddress())) {
-    return false;
-  }
-  
-  // For testing, consider all other devices as potential ESPs
-  // In a real implementation, you would want a more accurate way to identify your nodes
-  return true;
-}
-
-// Update or add a node's RSSI measurement
-void updateNodeRSSI(String mac, int rssi) {
-  // First check if we already know this node
-  for (int i = 0; i < nodeCount; i++) {
-    if (knownNodes[i].nodeID == mac) {
-      // Update existing entry
-      knownNodes[i].rssi = rssi;
-      knownNodes[i].lastUpdate = millis();
-      Serial.printf("Updated RSSI for node %s: %d dBm\n", mac.c_str(), rssi);
-      return;
-    }
-  }
-  
-  // If we get here, this is a new node
-  if (nodeCount < MAX_NODES) {
-    knownNodes[nodeCount].nodeID = mac;
-    knownNodes[nodeCount].rssi = rssi;
-    knownNodes[nodeCount].lastUpdate = millis();
-    nodeCount++;
-    Serial.printf("Added new node %s with RSSI: %d dBm\n", mac.c_str(), rssi);
-  } else {
-    Serial.println("WARNING: Too many nodes, cannot store more");
-  }
-}
-
-// Report calibration results to the server
-void reportCalibrationResults() {
-  if (nodeCount == 0) {
-    Serial.println("No other nodes found for calibration");
-    return;
-  }
-  
-  Serial.printf("Reporting calibration results for %d nodes\n", nodeCount);
-  
-  // Create JSON document
-  JsonDocument doc;
-  doc["type"] = "calibration_data";
-  doc["node_id"] = nodeID;
-  doc["mac"] = macAddress;
-  
-  JsonArray nodesArray = doc.createNestedArray("nodes");
-  
-  for (int i = 0; i < nodeCount; i++) {
-    JsonObject nodeObj = nodesArray.add<JsonObject>();
-    nodeObj["mac"] = knownNodes[i].nodeID;
-    nodeObj["rssi"] = knownNodes[i].rssi];
-  }
-  
-  // Serialize to string
-  String jsonStr;
-  serializeJson(doc, jsonStr);
-  
-  // Send to server
-  Serial.println("Sending calibration data to server:");
-  Serial.println(jsonStr);
-  webSocket.sendTXT(jsonStr);
-}
+// WebSocket client
+WebSocketsClient webSocket;
 
 void setup() {
+  // Initialize serial communication
   Serial.begin(115200);
-  delay(100);
+  Serial.println("\nESP8266 RSSI Mesh Node Starting");
   
-  Serial.println("\n\n=== ESP8266 Auto-Calibration Node ===");
-  
-  // Get MAC address
-  macAddress = WiFi.macAddress();
-  Serial.print("MAC Address: ");
-  Serial.println(macAddress);
-  
-  // Connect to WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // Connect to WiFi network
+  WiFi.mode(WIFI_AP_STA);                // Set to dual mode: Station + Access Point
+  WiFi.begin(ssid, password);
   
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  
-  Serial.println("\nWiFi connected");
-  Serial.print("IP address: ");
+  Serial.println();
+  Serial.print("Connected to WiFi, IP address: ");
   Serial.println(WiFi.localIP());
   
-  // Connect to the server via WebSocket
-  Serial.printf("Connecting to WebSocket server at %s:%d\n", 
-                MAC_SERVER_IP, MAC_SERVER_PORT);
-  
-  webSocket.begin(MAC_SERVER_IP, MAC_SERVER_PORT, "/ws");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
-  webSocket.setExtraHeaders("");
-  
-  Serial.println("WebSocket configuration complete");
+  // Connect to WebSocket server
+  connectWebSocket();
 }
 
 void loop() {
+  // Handle WebSocket events
   webSocket.loop();
   
-  // Send a ping periodically
-  unsigned long currentTime = millis();
-  if (currentTime - lastPingTime >= pingInterval) {
-    lastPingTime = currentTime;
-    webSocket.sendTXT("PING");
+  // If we have a nodeId assigned, perform scanning at the desired frequency
+  if (nodeId >= 0) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastScanTime >= scanInterval) {
+      scanForNodes();
+      sendRSSIData();
+      lastScanTime = currentTime;
+    }
+  }
+}
+
+void connectWebSocket() {
+  // WebSocket server setup
+  webSocket.begin(serverIP, serverPort, "/ws");
+  
+  // WebSocket event handler
+  webSocket.onEvent(webSocketEvent);
+  
+  // Set reconnect interval to 5s
+  webSocket.setReconnectInterval(5000);
+  
+  Serial.println("WebSocket connection established");
+}
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("WebSocket disconnected");
+      break;
+      
+    case WStype_CONNECTED:
+      Serial.println("WebSocket connected");
+      // Send registration message
+      sendRegistration();
+      break;
+      
+    case WStype_TEXT:
+      handleWebSocketMessage(payload, length);
+      break;
+    default:
+      Serial.println("New Event Type:");
+      break;
+  }
+}
+
+void sendRegistration() {
+  // Create JSON message for registration
+  DynamicJsonDocument doc(256);
+  doc["type"] = "register";
+  doc["mac"] = WiFi.macAddress();
+  
+  // Serialize JSON to string
+  String message;
+  serializeJson(doc, message);
+  
+  // Send registration message
+  webSocket.sendTXT(message);
+  Serial.println("Registration sent: " + message);
+}
+
+void handleWebSocketMessage(uint8_t * payload, size_t length) {
+  // Parse JSON message
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, payload, length);
+  
+  if (error) {
+    Serial.print("JSON parsing failed: ");
+    Serial.println(error.c_str());
+    return;
   }
   
-  // Periodically re-scan for other nodes during calibration phase
-  if (currentTime - lastScanTime >= SCAN_INTERVAL) {
-    lastScanTime = currentTime;
+  // Check message type
+  String type = doc["type"];
+  
+  if (type == "id_assignment") {
+    // Handle node ID assignment
+    nodeId = doc["id"];
+    apSSID = "node-" + String(nodeId);
     
-    // Only scan if we're in active calibration or if requested by server
-    // (This is just a placeholder - you would implement a proper state machine)
-    // scanForOtherNodes();
+    // Set up Access Point with the assigned ID
+    setupAP();
+    
+    Serial.print("Assigned node ID: ");
+    Serial.println(nodeId);
   }
+  else if (type == "node_list") {
+    // Handle list of active nodes
+    JsonArray nodes = doc["nodes"];
+    int nodeCount = 0;
+    
+    // Clear existing list first
+    for (int i = 0; i < MAX_NODES; i++) {
+      nodeSSIDs[i] = "";
+    }
+    
+    // Update node list
+    for (JsonVariant node : nodes) {
+      int id = node["id"];
+      if (id != nodeId && nodeCount < MAX_NODES) {  // Skip our own node
+        nodeSSIDs[nodeCount] = "node-" + String(id);
+        nodeCount++;
+      }
+    }
+    
+    Serial.print("Updated node list. Tracking ");
+    Serial.print(nodeCount);
+    Serial.println(" other nodes.");
+  }
+}
+
+void setupAP() {
+  // Setup access point with the assigned node ID
+  bool success = WiFi.softAP(apSSID.c_str(), "");
+  
+  if (success) {
+    Serial.print("Access Point created with SSID: ");
+    Serial.println(apSSID);
+    Serial.print("AP IP address: ");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("Failed to create Access Point");
+  }
+}
+
+void scanForNodes() {
+  Serial.println("Scanning for node APs...");
+  
+  // Start WiFi scan
+  int networks = WiFi.scanNetworks();
+  
+  // Reset RSSI values to minimum
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (nodeSSIDs[i] != "") {
+      lastRSSI[i] = -100;  // Default to very weak signal if not found
+    }
+  }
+  
+  if (networks > 0) {
+    // Go through all networks found
+    for (int i = 0; i < networks; i++) {
+      String currentSSID = WiFi.SSID(i);
+      int rssi = WiFi.RSSI(i);
+      
+      // Check if this network is one of our nodes
+      for (int j = 0; j < MAX_NODES; j++) {
+        if (nodeSSIDs[j] != "" && currentSSID == nodeSSIDs[j]) {
+          lastRSSI[j] = rssi;
+          Serial.print("Found node: ");
+          Serial.print(nodeSSIDs[j]);
+          Serial.print(" with RSSI: ");
+          Serial.println(rssi);
+        }
+      }
+    }
+  }
+  
+  // Free memory used by the scan
+  WiFi.scanDelete();
+}
+
+void sendRSSIData() {
+  // Only send if we have valid data
+  if (nodeId < 0) return;
+  
+  // Create JSON message with RSSI values
+  DynamicJsonDocument doc(1024);
+  doc["type"] = "rssi_report";
+  doc["node_id"] = nodeId;
+  doc["timestamp"] = millis();
+  
+  JsonArray measurements = doc.createNestedArray("measurements");
+  
+  for (int i = 0; i < MAX_NODES; i++) {
+    if (nodeSSIDs[i] != "") {
+      JsonObject measurement = measurements.createNestedObject();
+      
+      // Extract nodeId from SSID (format: "node-X")
+      String targetNodeId = nodeSSIDs[i].substring(5);
+      
+      measurement["target_id"] = targetNodeId.toInt();
+      measurement["rssi"] = lastRSSI[i];
+    }
+  }
+  
+  // Serialize JSON to string
+  String message;
+  serializeJson(doc, message);
+  
+  // Send RSSI data
+  webSocket.sendTXT(message);
 }
