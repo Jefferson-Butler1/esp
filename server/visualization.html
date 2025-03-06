@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>3D Trilateralization Visualization</title>
+    <style>
+        body { margin: 0; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            color: white;
+            font-family: Arial, sans-serif;
+            pointer-events: none;
+        }
+        #coordinates {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: white;
+            font-family: monospace;
+            background-color: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">ESP32 Trilateralization Visualization</div>
+    <div id="coordinates"></div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.7/dat.gui.min.js"></script>
+    <script>
+        // Three.js setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x121212);
+        
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(5, 5, 5);
+        camera.lookAt(0, 0, 0);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+        
+        // Add grid and axes
+        const gridHelper = new THREE.GridHelper(10, 10);
+        scene.add(gridHelper);
+        
+        const axesHelper = new THREE.AxesHelper(5);
+        scene.add(axesHelper);
+        
+        // Add lights
+        const ambientLight = new THREE.AmbientLight(0x404040);
+        scene.add(ambientLight);
+        
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
+        directionalLight.position.set(1, 1, 1);
+        scene.add(directionalLight);
+        
+        // Materials
+        const nodeMaterial = new THREE.MeshLambertMaterial({ color: 0x00ff00 });
+        const clientMaterial = new THREE.MeshLambertMaterial({ color: 0xff0000 });
+        
+        // Objects to store Three.js meshes
+        const nodeMeshes = {};
+        const clientMeshes = {};
+        
+        // Fetch data from server
+        function fetchVisualizationData() {
+            fetch('/visualization')
+                .then(response => response.json())
+                .then(data => {
+                    updateVisualization(data);
+                })
+                .catch(error => console.error('Error fetching visualization data:', error));
+        }
+        
+        // Update the 3D visualization
+        function updateVisualization(data) {
+            // Update node positions
+            for (const [id, position] of Object.entries(data.nodes)) {
+                if (!nodeMeshes[id]) {
+                    // Create new node mesh
+                    const geometry = new THREE.SphereGeometry(0.2, 32, 32);
+                    const mesh = new THREE.Mesh(geometry, nodeMaterial);
+                    
+                    // Add text label
+                    const canvas = document.createElement('canvas');
+                    const context = canvas.getContext('2d');
+                    canvas.width = 128;
+                    canvas.height = 64;
+                    context.fillStyle = 'white';
+                    context.font = '24px Arial';
+                    context.fillText(id, 10, 40);
+                    
+                    const texture = new THREE.CanvasTexture(canvas);
+                    const labelMaterial = new THREE.SpriteMaterial({ map: texture });
+                    const label = new THREE.Sprite(labelMaterial);
+                    label.scale.set(1, 0.5, 1);
+                    mesh.add(label);
+                    label.position.set(0, 0.5, 0);
+                    
+                    scene.add(mesh);
+                    nodeMeshes[id] = mesh;
+                }
+                
+                // Update position
+                nodeMeshes[id].position.set(position.X, position.Y, position.Z);
+            }
+            
+            // Update client positions
+            for (const [id, position] of Object.entries(data.clients)) {
+                if (!clientMeshes[id]) {
+                    // Create new client mesh
+                    const geometry = new THREE.BoxGeometry(0.3, 0.5, 0.2);
+                    const mesh = new THREE.Mesh(geometry, clientMaterial);
+                    
+                    // Add text label
+                    const canvas = document.createElement('canvas');
+                    const context = canvas.getContext('2d');
+                    canvas.width = 128;
+                    canvas.height = 64;
+                    context.fillStyle = 'white';
+                    context.font = '24px Arial';
+                    context.fillText(id, 10, 40);
+                    
+                    const texture = new THREE.CanvasTexture(canvas);
+                    const labelMaterial = new THREE.SpriteMaterial({ map: texture });
+                    const label = new THREE.Sprite(labelMaterial);
+                    label.scale.set(1, 0.5, 1);
+                    mesh.add(label);
+                    label.position.set(0, 0.5, 0);
+                    
+                    scene.add(mesh);
+                    clientMeshes[id] = mesh;
+                }
+                
+                // Update position
+                clientMeshes[id].position.set(position.X, position.Y, position.Z);
+                
+                // Update coordinates display
+                if (id === 'PHONE') {
+                    const coords = document.getElementById('coordinates');
+                    coords.innerHTML = `Phone Position:<br>X: ${position.X.toFixed(2)}<br>Y: ${position.Y.toFixed(2)}<br>Z: ${position.Z.toFixed(2)}`;
+                }
+            }
+        }
+        
+        // Animation loop
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+        
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+        
+        // Fetch data periodically
+        setInterval(fetchVisualizationData, 100); // 10 Hz update rate
+        
+        // Start animation
+        animate();
+    </script>
+</body>
+</html>
